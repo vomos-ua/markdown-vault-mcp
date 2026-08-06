@@ -171,6 +171,27 @@ class TestResolveRelativeLinkTargets:
         assert outlinks[0].exists is True
         assert col.graph.get_broken_links() == []
 
+    def test_percent_encoded_link_resolves(self, tmp_path: Path) -> None:
+        """[x](2%3D%3D%3DClient%20co/index.md) resolves to '2===Client co/index.md'."""
+        vault = tmp_path / "vault"
+        (vault / "2===Client co").mkdir(parents=True)
+        (vault / "guide.md").write_text(
+            "# Guide\n\nSee [client](./2%3D%3D%3DClient%20co/index.md).\n",
+            encoding="utf-8",
+        )
+        (vault / "2===Client co" / "index.md").write_text(
+            "# Client\n", encoding="utf-8"
+        )
+
+        col = Vault(source_dir=vault)
+        col.index.build_index()
+
+        outlinks = col.graph.get_outlinks("guide.md")
+        assert len(outlinks) == 1
+        assert outlinks[0].target_path == "2===Client co/index.md"
+        assert outlinks[0].exists is True
+        assert col.graph.get_broken_links() == []
+
     def test_reindex_keeps_resolution(self, tmp_path: Path) -> None:
         """Resolution survives an incremental reindex() run."""
         vault = tmp_path / "vault"

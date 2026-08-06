@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import sqlite3
+from urllib.parse import unquote
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -1840,18 +1841,25 @@ class FTSIndex:
             """
         ).fetchall()
 
+        def resolve_candidate(target: str) -> str | None:
+            if target in doc_set:
+                return target
+            if not target.lower().endswith(".md") and (target + ".md") in doc_set:
+                return target + ".md"
+            if (target.rstrip("/") + "/index.md") in doc_set:
+                return target.rstrip("/") + "/index.md"
+            # Route-style target (site-absolute or relative, written for
+            # the rendered site): match against prefix-stripped routes.
+            return route_map.get(route_key(target.lstrip("/")))
+
         updates: list[tuple[str, int]] = []
         for row in rows:
             target = row["target_path"]
-            new_path: str | None = None
-            if not target.lower().endswith(".md") and (target + ".md") in doc_set:
-                new_path = target + ".md"
-            elif (target.rstrip("/") + "/index.md") in doc_set:
-                new_path = target.rstrip("/") + "/index.md"
-            else:
-                # Route-style target (site-absolute or relative, written for
-                # the rendered site): match against prefix-stripped routes.
-                new_path = route_map.get(route_key(target.lstrip("/")))
+            new_path = resolve_candidate(target)
+            if new_path is None and "%" in target:
+                # Percent-encoded authoring ([x](dir%20name/file.md)) —
+                # retry the whole chain with the URL-decoded form.
+                new_path = resolve_candidate(unquote(target))
             if new_path and new_path != target:
                 updates.append((new_path, row["id"]))
 
