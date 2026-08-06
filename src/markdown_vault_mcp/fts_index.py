@@ -1781,11 +1781,13 @@ class FTSIndex:
            document on disk is ``.../04.task-model.md``.
         2. **Folder links** — ``[x](../02.agents)`` or ``[x](../02.agents/)``
            where the folder's landing document is ``.../02.agents/index.md``.
-        3. **Site-absolute links** — ``[x](/services/vault-mcp)`` where the
-           route is derived from the file path by stripping numeric ordering
-           prefixes (``NN.``) from each segment and dropping ``.md`` /
-           trailing ``index``.  Matching mirrors that derivation on both
-           sides; the shortest matching document path wins.
+        3. **Route-style links** — ``[x](/services/vault-mcp)`` or relative
+           ``[x](../01.about/regulations)`` where the route is derived from
+           the file path by stripping numeric ordering prefixes (``NN.``)
+           from each segment and dropping ``.md`` / trailing ``index``
+           (so ``.../regulations`` matches ``.../06.regulations.md``).
+           Matching mirrors that derivation on both sides; the shortest
+           matching document path wins.
 
         Only ``markdown`` and ``reference`` links whose current
         ``target_path`` does not match an indexed document are considered,
@@ -1846,8 +1848,9 @@ class FTSIndex:
                 new_path = target + ".md"
             elif (target.rstrip("/") + "/index.md") in doc_set:
                 new_path = target.rstrip("/") + "/index.md"
-            elif row["raw_target"].startswith("/"):
-                # Site-absolute route: match against prefix-stripped routes.
+            else:
+                # Route-style target (site-absolute or relative, written for
+                # the rendered site): match against prefix-stripped routes.
                 new_path = route_map.get(route_key(target.lstrip("/")))
             if new_path and new_path != target:
                 updates.append((new_path, row["id"]))

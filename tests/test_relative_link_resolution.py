@@ -147,6 +147,30 @@ class TestResolveRelativeLinkTargets:
         assert outlinks[0].target_path == "docs/page.md"
         assert outlinks[0].exists is True
 
+    def test_relative_route_matches_numeric_prefixed_file(
+        self, tmp_path: Path
+    ) -> None:
+        """[x](../01.about/regulations) matches 02.company/01.about/06.regulations.md."""
+        vault = tmp_path / "vault"
+        (vault / "02.company" / "02.agents").mkdir(parents=True)
+        (vault / "02.company" / "01.about").mkdir()
+        (vault / "02.company" / "02.agents" / "AGENTS.md").write_text(
+            "# Agents\n\nSee [regulations](../01.about/regulations).\n",
+            encoding="utf-8",
+        )
+        (vault / "02.company" / "01.about" / "06.regulations.md").write_text(
+            "# Regulations\n", encoding="utf-8"
+        )
+
+        col = Vault(source_dir=vault)
+        col.index.build_index()
+
+        outlinks = col.graph.get_outlinks("02.company/02.agents/AGENTS.md")
+        assert len(outlinks) == 1
+        assert outlinks[0].target_path == "02.company/01.about/06.regulations.md"
+        assert outlinks[0].exists is True
+        assert col.graph.get_broken_links() == []
+
     def test_reindex_keeps_resolution(self, tmp_path: Path) -> None:
         """Resolution survives an incremental reindex() run."""
         vault = tmp_path / "vault"
