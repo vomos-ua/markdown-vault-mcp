@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import re
 import sqlite3
 from collections import deque
 from pathlib import Path
@@ -26,6 +27,11 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
+
+
+# Numeric ordering prefix ("07.services" -> "services") stripped from path
+# segments when deriving rendered-site routes in resolve_relative_link_targets.
+_ROUTE_NUMERIC_PREFIX_RE = re.compile(r"^\d+\.")
 
 
 # Thresholds for running FTS5 'optimize' after a bulk purge.  Deleting rows
@@ -1760,6 +1766,100 @@ class FTSIndex:
 
         if updated:
             logger.debug("resolve_vault_wikilinks: resolved %d wikilink(s)", updated)
+        return updated
+
+    @_retry_on_locked
+    def resolve_relative_link_targets(self) -> int:
+        """Resolve markdown/reference link targets written for a rendered site.
+
+        Docs-site vaults (Docus, Nuxt Content, MkDocs, ...) commonly author
+        links for the *rendered route* rather than the file tree, which
+        leaves three classes of scan-time targets pointing at paths that are
+        not indexed documents:
+
+        1. **Extensionless links** — ``[x](./04.task-model)`` where the
+           document on disk is ``.../04.task-model.md``.
+        2. **Folder links** — ``[x](../02.agents)`` or ``[x](../02.agents/)``
+           where the folder's landing document is ``.../02.agents/index.md``.
+        3. **Site-absolute links** — ``[x](/services/vault-mcp)`` where the
+           route is derived from the file path by stripping numeric ordering
+           prefixes (``NN.``) from each segment and dropping ``.md`` /
+           trailing ``index``.  Matching mirrors that derivation on both
+           sides; the shortest matching document path wins.
+
+        Only ``markdown`` and ``reference`` links whose current
+        ``target_path`` does not match an indexed document are considered,
+        so the pass is idempotent and never rewrites a working link.
+        Wikilinks have their own vault-wide pass
+        (:meth:`resolve_vault_wikilinks`).
+
+        Call this after all documents have been indexed, alongside
+        :meth:`resolve_vault_wikilinks`.
+
+        Returns:
+            Number of link rows whose ``target_path`` was updated.
+        """
+        conn = self._conn()
+        doc_paths: list[str] = [
+            r["path"] for r in conn.execute("SELECT path FROM documents").fetchall()
+        ]
+        doc_set = set(doc_paths)
+
+        def route_key(path: str) -> str:
+            """Derive the rendered-site route for a document path."""
+            parts = [
+                _ROUTE_NUMERIC_PREFIX_RE.sub("", p)
+                for p in path.split("/")
+                if p not in ("", ".")
+            ]
+            if parts and parts[-1].lower().endswith(".md"):
+                parts[-1] = parts[-1][:-3]
+            if parts and parts[-1].lower() == "index":
+                parts.pop()
+            return "/".join(p.lower() for p in parts)
+
+        # Route -> shortest matching document path (mirrors the
+        # shortest-path-wins rule of resolve_vault_wikilinks).
+        route_map: dict[str, str] = {}
+        for p in doc_paths:
+            key = route_key(p)
+            prev = route_map.get(key)
+            if prev is None or len(p) < len(prev):
+                route_map[key] = p
+
+        rows = conn.execute(
+            """
+            SELECT l.id, l.raw_target, l.target_path
+            FROM links l
+            WHERE l.link_type IN ('markdown', 'reference')
+              AND NOT EXISTS (
+                  SELECT 1 FROM documents d WHERE d.path = l.target_path
+              )
+            """
+        ).fetchall()
+
+        updates: list[tuple[str, int]] = []
+        for row in rows:
+            target = row["target_path"]
+            new_path: str | None = None
+            if not target.lower().endswith(".md") and (target + ".md") in doc_set:
+                new_path = target + ".md"
+            elif (target.rstrip("/") + "/index.md") in doc_set:
+                new_path = target.rstrip("/") + "/index.md"
+            elif row["raw_target"].startswith("/"):
+                # Site-absolute route: match against prefix-stripped routes.
+                new_path = route_map.get(route_key(target.lstrip("/")))
+            if new_path and new_path != target:
+                updates.append((new_path, row["id"]))
+
+        with conn:
+            conn.executemany("UPDATE links SET target_path = ? WHERE id = ?", updates)
+        updated = len(updates)
+
+        if updated:
+            logger.debug(
+                "resolve_relative_link_targets: resolved %d link(s)", updated
+            )
         return updated
 
     @_retry_on_locked

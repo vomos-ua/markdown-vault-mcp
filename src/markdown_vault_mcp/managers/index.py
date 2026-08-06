@@ -468,6 +468,7 @@ class IndexManager:
 
         # Resolve vault-wide wikilinks now that all documents are indexed.
         self._fts.resolve_vault_wikilinks()
+        self._fts.resolve_relative_link_targets()
 
         # Record skipped files (excluded, missing frontmatter, unparseable)
         # in tracker state too, so the first reindex() — including the boot
@@ -621,6 +622,7 @@ class IndexManager:
 
         # Re-resolve vault-wide wikilinks.
         self._fts.resolve_vault_wikilinks()
+        self._fts.resolve_relative_link_targets()
 
         # Rebuild tracker state from current FTS index contents.
         state_notes: list[ParsedNote] = [
@@ -1410,6 +1412,12 @@ class IndexManager:
                 self._fts.resolve_vault_wikilinks()
             except Exception:
                 logger.exception("process_dirty_paths: resolve_vault_wikilinks failed")
+            try:
+                self._fts.resolve_relative_link_targets()
+            except Exception:
+                logger.exception(
+                    "process_dirty_paths: resolve_relative_link_targets failed"
+                )
 
     def flush_dirty_embeddings(self, paths: set[str]) -> None:
         """Re-embed each path in the snapshot and save the vector index once.
