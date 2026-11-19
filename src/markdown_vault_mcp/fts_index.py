@@ -7,10 +7,10 @@ import json
 import logging
 import re
 import sqlite3
-from urllib.parse import unquote
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import unquote
 
 from markdown_vault_mcp._fts_connection import (
     SqliteConnectionRegistry,
@@ -280,6 +280,84 @@ def _quote_fts_query(query: str) -> str:
     """
     tokens = query.split()
     return " ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+
+
+# Function words dropped from a relaxed query (see _relaxed_fts_query). They
+# match nearly every document, so as OR-terms they only add noise. Ukrainian
+# and English, lower-case; words shorter than 3 characters are dropped anyway.
+_RELAX_STOPWORDS_UK = """
+хто що чого чим кого кому коли куди звідки чому який яка яке які якого якої
+після через щоб якщо перед поки біля між для про при під над без від або але
+тому теж також вже лише тільки ось усе все всі усі цей цього той тієї тих
+було буде були бути можна треба потрібно нам наш наша наше наші нашому нашій
+мені мій моя моє мої тебе твій вона воно вони його їх ним нею ними там тут
+так таке такий така такі нічого щось робити зробити правильно
+"""  # noqa: RUF001 - Ukrainian words, Cyrillic letters are intended
+_RELAX_STOPWORDS_EN = """
+the and for with what how why who whom where when which that this these those
+from into about after before does did can could should would will are was
+were has have had not you your our its than then there
+"""
+_RELAX_STOPWORDS = frozenset(_RELAX_STOPWORDS_UK.split() + _RELAX_STOPWORDS_EN.split())
+
+# Explicit FTS5 syntax: when the caller wrote operators, phrases, prefixes,
+# groups or a filter on a real notes_fts column, an empty result is the
+# answer and the query is not relaxed.
+_FTS_SYNTAX_RE = re.compile(
+    r'"|\*|\^|[()]|\b(?:AND|OR|NOT|NEAR)\b'
+    r"|\b(?:path|title|folder|heading|content|summary)\s*:"
+)
+
+# Same word boundaries as the unicode61 tokenizer: letters, digits, underscore.
+_FTS_WORD_RE = re.compile(r"\w+")
+
+
+def _prefix_stem(word: str) -> str:
+    """Return an FTS5 prefix term that also matches inflected forms of *word*.
+
+    ASCII words are left whole: the ``porter`` tokenizer already stems
+    English on both sides. Other scripts (Cyrillic in practice) have no
+    stemmer in the index, so the inflectional ending is cut off: two
+    characters from words of 7+ characters, one from words of 5-6, none from
+    shorter ones (``заливає`` -> ``залив*``, ``картку`` -> ``картк*``).
+    """
+    n = len(word)
+    if word.isascii() or n < 5:
+        return word + "*"
+    return word[: n - (2 if n >= 7 else 1)] + "*"
+
+
+def _relaxed_fts_query(query: str) -> str:
+    """Rewrite a natural-language query as an OR of prefix terms.
+
+    FTS5 reads ``a b c`` as ``a AND b AND c``: a question typed as a sentence
+    (``хто заливає довге відео на ютуб``) only matches a document containing
+    every word in that exact form, so it returns nothing, and in hybrid mode
+    the keyword channel silently drops out. The relaxed form drops function
+    words, turns each remaining word into a prefix term (:func:`_prefix_stem`)
+    and joins them with ``OR``; BM25 then ranks documents by how many of the
+    terms they contain and how rare those terms are.
+
+    Args:
+        query: The raw user query that matched nothing.
+
+    Returns:
+        The relaxed MATCH expression, or ``""`` when the query uses explicit
+        FTS5 syntax or has fewer than two content words (relaxing would
+        not change the result).
+    """
+    if _FTS_SYNTAX_RE.search(query):
+        return ""
+    terms: list[str] = []
+    for word in _FTS_WORD_RE.findall(query.lower()):
+        if len(word) < 3 or word in _RELAX_STOPWORDS:
+            continue
+        term = _prefix_stem(word)
+        if term not in terms:
+            terms.append(term)
+    if len(terms) < 2:
+        return ""
+    return " OR ".join(terms)
 
 
 def _derive_folder(path: str) -> str:
@@ -1256,8 +1334,62 @@ class FTSIndex:
             limit,
             snippet_words,
         )
+        rows = self._match_rows(_execute, query)
+        if not rows:
+            # A sentence-style query is an implicit AND of every word and
+            # usually matches nothing; retry it as an OR of prefix terms so
+            # keyword and hybrid search still see the content words.
+            relaxed = _relaxed_fts_query(query)
+            if relaxed:
+                logger.debug(
+                    "FTS search: no match for %r; retrying relaxed %r", query, relaxed
+                )
+                try:
+                    rows = _execute(relaxed).fetchall()
+                except sqlite3.OperationalError as exc:
+                    if not _is_fts5_query_error(exc):
+                        raise
+                    # Built from barewords only, so this should not happen;
+                    # quoting would turn OR into a search word, so give up.
+                    logger.warning(
+                        "fts_search_relaxed_unexecutable query=%r relaxed=%r reason=%s",
+                        query,
+                        relaxed,
+                        exc,
+                    )
+        logger.debug("FTS search: %d results for query=%r", len(rows), query)
+
+        results: list[FTSResult] = []
+        for row in rows:
+            results.append(
+                FTSResult(
+                    path=row["path"],
+                    title=row["title"],
+                    folder=row["folder"],
+                    heading=row["heading"] or None,
+                    content=row["content"],
+                    score=row["score"],
+                    chunk_count=row["chunk_count"],
+                    start_line=row["start_line"],
+                    section_id=row["section_id"],
+                )
+            )
+        return results
+
+    @staticmethod
+    def _match_rows(execute: Any, query: str) -> list[sqlite3.Row]:
+        """Run one MATCH expression, retrying a malformed one quoted (#866).
+
+        Args:
+            execute: Callable that runs the search SQL for a MATCH string.
+            query: The MATCH expression to run.
+
+        Returns:
+            The fetched rows, or ``[]`` when FTS5 rejects the query even
+            after every token is quoted.
+        """
         try:
-            cur = _execute(query)
+            cur = execute(query)
         except sqlite3.OperationalError as exc:
             if not _is_fts5_query_error(exc):
                 raise
@@ -1278,7 +1410,7 @@ class FTSIndex:
                 fallback,
             )
             try:
-                cur = _execute(fallback)
+                cur = execute(fallback)
             except sqlite3.OperationalError as retry_exc:
                 if not _is_fts5_query_error(retry_exc):
                     raise
@@ -1293,25 +1425,7 @@ class FTSIndex:
                     retry_exc,
                 )
                 return []
-        rows = cur.fetchall()
-        logger.debug("FTS search: %d results for query=%r", len(rows), query)
-
-        results: list[FTSResult] = []
-        for row in rows:
-            results.append(
-                FTSResult(
-                    path=row["path"],
-                    title=row["title"],
-                    folder=row["folder"],
-                    heading=row["heading"] or None,
-                    content=row["content"],
-                    score=row["score"],
-                    chunk_count=row["chunk_count"],
-                    start_line=row["start_line"],
-                    section_id=row["section_id"],
-                )
-            )
-        return results
+        return cur.fetchall()
 
     @_retry_on_locked
     def get_note(self, path: str) -> dict[str, Any] | None:
@@ -1868,9 +1982,7 @@ class FTSIndex:
         updated = len(updates)
 
         if updated:
-            logger.debug(
-                "resolve_relative_link_targets: resolved %d link(s)", updated
-            )
+            logger.debug("resolve_relative_link_targets: resolved %d link(s)", updated)
         return updated
 
     @_retry_on_locked

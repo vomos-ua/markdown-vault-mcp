@@ -355,10 +355,65 @@ class TestSearch:
         # `nonexistent_column:value` raises "no such column"; the fallback
         # quotes it into one phrase literal ("nonexistent column value", a
         # single adjacency phrase) — those tokens are not adjacent in the doc,
-        # so no match.
-        assert idx.search("nonexistent_column:value") == []
-        # ...but the bare word does match once the column syntax is gone.
+        # so the quoted form matches nothing; the relaxed OR-of-prefixes retry
+        # then finds the document by its content word.
+        assert [r.path for r in idx.search("nonexistent_column:value")] == ["a.md"]
+        # ...and the bare word matches directly.
         assert [r.path for r in idx.search("value")] == ["a.md"]
+
+    def test_search_sentence_query_relaxes_to_or_of_prefixes(self) -> None:
+        """A sentence whose words never all co-occur still finds the
+        document that holds most of them, in inflected forms."""
+        idx = FTSIndex(":memory:")
+        idx.upsert_note(
+            make_note(
+                "delivery.md",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="Відеокреатор заливає відео на YouTube після монтажу.",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        idx.upsert_note(
+            make_note(
+                "other.md",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="Короткий опис календаря.",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        hits = idx.search("хто заливав довге відео на youtube після монтажу")
+        assert [r.path for r in hits] == ["delivery.md"]
+
+    def test_search_explicit_syntax_is_not_relaxed(self) -> None:
+        """Operators, phrases and prefixes are honoured as written: an empty
+        result stays empty."""
+        idx = FTSIndex(":memory:")
+        idx.upsert_note(
+            make_note(
+                "a.md",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="alpha beta",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        assert idx.search('"beta alpha"') == []
+        assert idx.search("alpha AND gamma") == []
+        assert idx.search("gam* beta*") == []
 
     def test_search_non_fts5_operational_error_propagates(self) -> None:
         """Non-FTS5 OperationalError (e.g. DB lock) must propagate, not return []."""
@@ -472,9 +527,11 @@ class TestSearch:
 
         idx = FTSIndex(":memory:")
         mock_conn = MagicMock()
+        # Raw, quoted and relaxed (`vault* OR mcp*`) attempts are all rejected.
         mock_conn.execute.side_effect = [
             sqlite3.OperationalError('fts5: syntax error near "-"'),
             sqlite3.OperationalError("fts5: unterminated string"),
+            sqlite3.OperationalError('fts5: syntax error near "*"'),
         ]
         idx._conn = lambda: mock_conn  # type: ignore[method-assign]
         with caplog.at_level(logging.WARNING, logger="markdown_vault_mcp.fts_index"):
@@ -1549,3 +1606,29 @@ class TestPersistedRankConfig:
         default_idx.close()
 
         assert reset_scores == default_scores
+
+
+class TestRelaxedQuery:
+    def test_drops_stopwords_and_stems_cyrillic(self) -> None:
+        from markdown_vault_mcp.fts_index import _relaxed_fts_query
+
+        assert _relaxed_fts_query("як правильно назвати картку задачі") == (
+            "назва* OR картк* OR задач*"
+        )
+
+    def test_ascii_words_kept_whole(self) -> None:
+        from markdown_vault_mcp.fts_index import _relaxed_fts_query
+
+        assert _relaxed_fts_query("CRM Kommo MCP") == "crm* OR kommo* OR mcp*"
+
+    def test_single_content_word_is_not_relaxed(self) -> None:
+        from markdown_vault_mcp.fts_index import _relaxed_fts_query
+
+        assert _relaxed_fts_query("що таке kommo") == ""
+
+    def test_explicit_syntax_is_not_relaxed(self) -> None:
+        from markdown_vault_mcp.fts_index import _relaxed_fts_query
+
+        assert _relaxed_fts_query("kommo OR crm") == ""
+        assert _relaxed_fts_query('"exact phrase" here') == ""
+        assert _relaxed_fts_query("pref* word") == ""
